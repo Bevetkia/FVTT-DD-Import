@@ -124,47 +124,61 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
 
 
   static async _onSubmit(event, form, formData) {
+    let submitData = formData.object;
+
+    if ((!submitData.bucket) && submitData.source == "s3")
+      return ui.notifications.error("Bucket required for S3 upload");
+
+    let fileContents;
     try {
+      fileContents = await this._getFileContents();
+    } catch (e) {
+      console.error("DD-Import error reading files", e);
+      ui.notifications.error("Error reading files: " + (e?.message || e));
+      return;
+    }
+    if (fileContents.length === 0) {
+      return ui.notifications.error("No valid files to import.");
+    }
 
-      let submitData = formData.object;
+    let effectiveMode = submitData.mode;
+    if (fileContents.length <= 1) effectiveMode = "l";
 
-      if ((!submitData.bucket) && submitData.source == "s3")
-        return ui.notifications.error("Bucket required for S3 upload")
+    game.settings.set("dd-import", "importSettings", {
+      source: submitData.source,
+      bucket: submitData.bucket,
+      path: submitData.path,
+      offset: submitData.offset,
+      padding: submitData.padding,
+      fidelity: submitData.fidelity,
+      multiImageMode: submitData.mode,
+      webpConversion: submitData.toWebp,
+      webpQuality: submitData.webpQuality,
+      wallsAroundFiles: submitData.wallsAroundFiles,
+    });
 
-      if (["g", "y", "x"].includes(submitData.mode))
+    try {
+      if (["g", "y", "x"].includes(effectiveMode))
       {
-        this._legacyImport(submitData);
+        await this._legacyImport(submitData, fileContents);
       }
-      else 
+      else
       {
-        this._handleImport(submitData);
+        await this._handleImport(submitData, fileContents);
       }
-
-      game.settings.set("dd-import", "importSettings", {
-        source: submitData.source,
-        bucket: submitData.bucket,
-        path: submitData.path,
-        offset: submitData.offset,
-        padding: submitData.padding,
-        fidelity: submitData.fidelity,
-        multiImageMode: submitData.mode,
-        webpConversion: submitData.toWebp,
-        webpQuality: submitData.webpQuality,
-        wallsAroundFiles: submitData.wallsAroundFiles,
-      });
     }
     catch (e) {
-      ui.notifications.error("Error Importing: " + e)
+      console.error("DD-Import error", e);
+      ui.notifications.error("Error Importing: " + (e?.message || e));
     }
   }
 
-  async _handleImport(importData)
+  async _handleImport(importData, files)
   {
-    let files = await this._getFileContents();
-
     this._checkFileContents(files)
 
-    let sceneData = this._initializeSceneData(importData, this._getLargestDimensions(files));
+    let defaultPpg = files[0]?.resolution?.pixels_per_grid || 100;
+    let sceneData = this._initializeSceneData(importData, this._getLargestDimensions(files), defaultPpg);
 
     for(let content of files)
     {
@@ -174,18 +188,16 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
       await this._uploadLevelImages(content, sceneData, importData);
     }
 
-    Scene.create(sceneData).then(scene => {
-      scene.createThumbnail().then(thumb => {
-        scene.update({ "thumb": thumb.thumb });
-      })
-    });
+    const scene = await Scene.create(sceneData);
+    const thumb = await scene.createThumbnail();
+    await scene.update({ thumb: thumb.thumb });
   }
 
   async _uploadLevelImages(content, scene, importData)
   {
     let extension = DDImporter.getImageType(atob(content.image.substr(0, 8)));
 
-    if (importData.toWebp) 
+    if (importData.toWebp)
     {
       extension = 'webp';
     }
@@ -195,45 +207,42 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
 
     let res = content.resolution;
     let width = res.map_size.x * res.pixels_per_grid;
-    let height = res.map_size.x * res.pixels_per_grid;
-    
+    let height = res.map_size.y * res.pixels_per_grid;
+
     let canvas = document.createElement('canvas');
     canvas.width = width;
     canvas.height = height;
     let canvasContext = canvas.getContext("2d");
 
+    await DDImporter.image2Canvas(canvasContext, content, extension, width, height);
 
-    await DDImporter.image2Canvas(canvasContext, content, extension, width, height)
-
-
-    var p = new Promise(function (resolve) {
+    await new Promise(function (resolve, reject) {
       canvas.toBlob(function (blob) {
-        blob.arrayBuffer().then(bfr => 
-        {
-          DDImporter.uploadFile(bfr, content.name, importData.path, importData.source, extension, importData.bucket)
-            .then(function () {
-              resolve()
-            })
-        });
-      }, "image/" + extension, (importData.toWebp ? importData.webpQuality : undefined))
-    })
-
-    await p;
-
+        if (!blob) {
+          reject(new Error(`Canvas encoding failed. Dimensions ${canvas.width}x${canvas.height}.`));
+          return;
+        }
+        blob.arrayBuffer()
+          .then(bfr => DDImporter.uploadFile(bfr, content.name, importData.path, importData.source, extension, importData.bucket))
+          .then(resolve)
+          .catch(reject);
+      }, "image/" + extension, (importData.toWebp ? importData.webpQuality : undefined));
+    });
   }
 
-  _initializeSceneData(importData, dimensions)
+  _initializeSceneData(importData, dimensions, defaultPpg)
   {
 
     let gridSize;
     if (importData.useCustomPixelsPerGrid) {
       gridSize = importData.customPixelsPerGrid
+    } else {
+      gridSize = defaultPpg;
     }
 
     return {
         name: importData.sceneName || importData.levelName0 || "New Scene",
         padding: importData.padding,
-        height: 0,
         levels: [],
         walls: [],
         lights: [],
@@ -372,40 +381,18 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
   }
 
 
-  async _legacyImport({sceneName, fidelity, offset, padding, source, bucket, path, mode, toWebp, webpQuality, objectWalls, wallsAroundFiles, imageFileName, useCustomPixelsPerGrid, customPixelsPerGrid}={})
+  async _legacyImport({sceneName, fidelity, offset, padding, source, bucket, path, mode, toWebp, webpQuality, objectWalls, wallsAroundFiles, imageFileName, useCustomPixelsPerGrid, customPixelsPerGrid}={}, files)
   {
 
     let firstFileName;
-    let files = []
     var fileName = 'combined'
-    for (var i = 0; i < this.fileCounter; i++) {
-      let fe = this.element.querySelector("[name=file" + i + "]")
-      if (fe.files[0] === undefined) {
-        continue
-      }
-      try {
-        files.push(JSON.parse(await fe.files[0].text()));
-        fileName = fileName + '-' + fe.files[0].name.split(".")[0];
-        // save the first filename
-        if (files.length == 1) {
-          firstFileName = fe.files[0].name.split(".")[0]
-        }
-      } catch (e) {
-        if (this.fileCounter > 1) {
-          ui.notifications.warn("Skipping due to error while importing: " + fe.files[0].name + " " + e)
-        } else {
-          throw (e)
-        }
-      }
-    }
-    // keep the original filename if it is only one file at all
-    if (files.length == 0) {
-      ui.notifications.error("Skipped all files while importing.")
-      throw new Error("Skipped all files");
+    for (let f of files) {
+      fileName = fileName + '-' + f.name;
+      if (firstFileName === undefined) firstFileName = f.name;
     }
     if (files.length == 1) {
       fileName = firstFileName;
-    } else {
+    } else if (files.length > 1) {
       ui.notifications.notify("Combining images may take quite some time, be patient")
     }
     if (imageFileName) {
@@ -418,13 +405,13 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
     }
 
     // determine the pixels per grid value to use
-    let pixelsPerGrid = ""
+    let pixelsPerGrid;
     if (useCustomPixelsPerGrid) {
       pixelsPerGrid = customPixelsPerGrid
     } else {
       pixelsPerGrid = files[0].resolution.pixels_per_grid
     }
-    console.log("Grid PPI = ", pixelsPerGrid)
+    console.log("Grid PPI =", pixelsPerGrid);
 
     // do the placement math
     let size = {}
@@ -500,14 +487,16 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
       image_type = 'webp';
     }
 
-    var p = new Promise(function (resolve) {
+    var p = new Promise(function (resolve, reject) {
       thecanvas.toBlob(function (blob) {
-        blob.arrayBuffer().then(bfr => {
-          DDImporter.uploadFile(bfr, fileName, path, source, image_type, bucket)
-            .then(function () {
-              resolve()
-            })
-        });
+        if (!blob) {
+          reject(new Error(`Canvas encoding failed. Dimensions ${thecanvas.width}x${thecanvas.height}.`));
+          return;
+        }
+        blob.arrayBuffer()
+          .then(bfr => DDImporter.uploadFile(bfr, fileName, path, source, image_type, bucket))
+          .then(resolve)
+          .catch(reject);
       }, "image/" + image_type, (toWebp ? webpQuality : undefined))
     })
 
@@ -569,7 +558,7 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
     ui.notifications.notify("Upload still in progress, please wait")
     await p
     ui.notifications.notify("Creating scene")
-    DDImporter.DDImport(aggregated, sceneName, fileName, path, fidelity, offset, padding, image_type, bucket, game.data.files.s3?.endpoint, source, pixelsPerGrid)
+    await DDImporter.DDImport(aggregated, sceneName, fileName, path, fidelity, offset, padding, image_type, bucket, game.data.files.s3?.endpoint, source, pixelsPerGrid)
   }
 
 
