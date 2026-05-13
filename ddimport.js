@@ -38,6 +38,64 @@ Hooks.on("init", () => {
   })
 })
 
+class DDImportProgress extends foundry.applications.api.HandlebarsApplicationMixin(foundry.applications.api.ApplicationV2) {
+
+  static DEFAULT_OPTIONS = {
+    id: "dd-import-progress",
+    classes: ["dd-import-progress", "standard-form"],
+    window: {
+      title: "Importing Map",
+      resizable: false,
+      controls: []
+    },
+    position: { width: 420 }
+  };
+
+  static PARTS = {
+    form: { template: "modules/dd-import/progress.hbs" }
+  };
+
+  _backdrop = null;
+
+  async _onRender(options) {
+    await super._onRender(options);
+    if (!this._backdrop) {
+      this._backdrop = document.createElement("div");
+      this._backdrop.className = "dd-import-modal-backdrop";
+      document.body.appendChild(this._backdrop);
+    }
+    this.element.style.zIndex = "100";
+    const closeBtn = this.element.closest(".application")?.querySelector("[data-action='close']");
+    if (closeBtn) closeBtn.style.display = "none";
+  }
+
+  async close(options) {
+    if (this._backdrop) {
+      this._backdrop.remove();
+      this._backdrop = null;
+    }
+    return super.close(options);
+  }
+
+  // Pass null/undefined for any argument to leave that field unchanged.
+  update(phase, valueOrIndeterminate, max, detail) {
+    if (!this.element) return;
+    const phaseEl = this.element.querySelector(".dd-progress-phase");
+    const detailEl = this.element.querySelector(".dd-progress-detail");
+    const bar = this.element.querySelector(".dd-progress-bar");
+    if (phase != null && phaseEl) phaseEl.textContent = phase;
+    if (detail != null && detailEl) detailEl.textContent = detail;
+    if (!bar) return;
+    if (valueOrIndeterminate === "indeterminate") {
+      bar.removeAttribute("value");
+      bar.removeAttribute("max");
+    } else if (valueOrIndeterminate != null) {
+      bar.value = Number(valueOrIndeterminate);
+      bar.max = Number(max ?? 100);
+    }
+  }
+}
+
 class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(foundry.applications.api.ApplicationV2) {
 
   static DEFAULT_OPTIONS = {
@@ -58,7 +116,7 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
     },
     form: {
       submitOnChange: false,
-      closeOnSubmit: true,
+      closeOnSubmit: false,
       handler : this._onSubmit
     }
 }
@@ -157,23 +215,32 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
       wallsAroundFiles: submitData.wallsAroundFiles,
     });
 
+    const progress = new DDImportProgress();
+    await progress.render({ force: true });
+    progress.update("Starting import", 0, 100, "");
+
     try {
       if (["g", "y", "x"].includes(effectiveMode))
       {
-        await this._legacyImport(submitData, fileContents);
+        await this._legacyImport(submitData, fileContents, progress);
       }
       else
       {
-        await this._handleImport(submitData, fileContents);
+        await this._handleImport(submitData, fileContents, progress);
       }
+      progress.update("Done", 100, 100, "");
+      setTimeout(() => progress.close(), 800);
+      this.close();
     }
     catch (e) {
       console.error("DD-Import error", e);
       ui.notifications.error("Error Importing: " + (e?.message || e));
+      progress.close();
+      // Importer stays open so the user can adjust settings and retry without re-selecting files.
     }
   }
 
-  async _handleImport(importData, files)
+  async _handleImport(importData, files, progress)
   {
     this._checkFileContents(files)
 
@@ -193,29 +260,35 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
 
     let sceneData = this._initializeSceneData(importData, this._getLargestDimensions(files, effectivePpg), effectivePpg);
 
-    for(let content of files)
-    {
-      ui.notifications.notify("Creating Level: " + content.levelName);
+    const total = files.length;
+    for (let i = 0; i < files.length; i++) {
+      const content = files[i];
+      progress.update(`Level ${i + 1}/${total}: ${content.levelName}`, i, total, "preparing");
       this._addLevelData(sceneData, content, importData);
-      ui.notifications.notify("Uploading Level image " + content.name);
-      await this._uploadLevelImages(content, sceneData, importData);
+      progress.update(`Level ${i + 1}/${total}: ${content.levelName}`, i + 0.3, total, "processing image");
+      await this._uploadLevelImages(content, sceneData, importData, progress);
+      progress.update(`Level ${i + 1}/${total}: ${content.levelName}`, i + 1, total, "done");
     }
 
+    progress.update("Creating scene", "indeterminate", null, "");
     const scene = await Scene.create(sceneData);
     const thumb = await scene.createThumbnail();
     await scene.update({ thumb: thumb.thumb });
   }
 
-  async _uploadLevelImages(content, scene, importData)
+  async _uploadLevelImages(content, scene, importData, progress)
   {
     content.pos_in_image = {x: 0, y: 0};
     content.pos_in_grid = {x: 0, y: 0};
 
     // Skip the canvas roundtrip when no format conversion is needed.
     if (!importData.toWebp) {
+      progress?.update(null, "indeterminate", null, "Direct upload " + content.name);
       await DDImporter._uploadFromSourceImage(content, importData);
       return;
     }
+
+    progress?.update(null, "indeterminate", null, "WebP encoding " + content.name);
 
     const extension = 'webp';
     const effectivePpg = scene.grid.size;
@@ -387,7 +460,7 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
   }
 
 
-  async _legacyImport({sceneName, fidelity, offset, padding, source, bucket, path, mode, toWebp, webpQuality, objectWalls, wallsAroundFiles, imageFileName, useCustomPixelsPerGrid, customPixelsPerGrid}={}, files)
+  async _legacyImport({sceneName, fidelity, offset, padding, source, bucket, path, mode, toWebp, webpQuality, objectWalls, wallsAroundFiles, imageFileName, useCustomPixelsPerGrid, customPixelsPerGrid}={}, files, progress)
   {
 
     let firstFileName;
@@ -504,18 +577,17 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
     thecanvas.width = width;
     thecanvas.height = height;
     let mycanvas = thecanvas.getContext("2d");
-    ui.notifications.notify("Processing Images")
     for (var fidx = 0; fidx < files.length; fidx++) {
-      ui.notifications.notify("Processing " + (fidx + 1) + " out of " + files.length + " images")
+      progress.update(`Tile ${fidx + 1}/${files.length}`, fidx, files.length, "drawing to canvas")
       let f = files[fidx];
       image_type = DDImporter.getImageType(atob(f.image.substr(0, 8)));
       await DDImporter.image2Canvas(mycanvas, f, image_type, size.x, size.y)
     }
-    ui.notifications.notify("Uploading image ....")
-    if (toWebp) 
+    if (toWebp)
     {
       image_type = 'webp';
     }
+    progress.update("Upload", "indeterminate", null, fileName + "." + image_type);
 
     var p = new Promise(function (resolve, reject) {
       thecanvas.toBlob(function (blob) {
@@ -585,9 +657,8 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
       aggregated.lights = aggregated.lights.concat(f.lights)
       aggregated.portals = aggregated.portals.concat(f.portals)
     }
-    ui.notifications.notify("Upload still in progress, please wait")
     await p
-    ui.notifications.notify("Creating scene")
+    progress.update("Creating scene", "indeterminate", null, sceneName);
     await DDImporter.DDImport(aggregated, sceneName, fileName, path, fidelity, offset, padding, image_type, bucket, game.data.files.s3?.endpoint, source, pixelsPerGrid)
   }
 
