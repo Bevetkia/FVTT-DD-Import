@@ -177,8 +177,21 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
   {
     this._checkFileContents(files)
 
-    let defaultPpg = files[0]?.resolution?.pixels_per_grid || 100;
-    let sceneData = this._initializeSceneData(importData, this._getLargestDimensions(files), defaultPpg);
+    // Determine the effective scene PPG that fits browser canvas limits for *every* level.
+    // Must be computed before _addLevelData so walls/lights/doors share the same scale as the image.
+    const requestedPpg = importData.useCustomPixelsPerGrid
+      ? importData.customPixelsPerGrid
+      : (files[0]?.resolution?.pixels_per_grid || 100);
+    let effectivePpg = requestedPpg;
+    for (const f of files) {
+      const r = DDImporter._computeEffectivePPG(f.resolution.map_size.x, f.resolution.map_size.y, requestedPpg);
+      if (r.ppg < effectivePpg) effectivePpg = r.ppg;
+    }
+    if (effectivePpg < requestedPpg) {
+      ui.notifications.warn(`Image downscaled (browser canvas limit): PPI ${requestedPpg} -> ${effectivePpg}`);
+    }
+
+    let sceneData = this._initializeSceneData(importData, this._getLargestDimensions(files, effectivePpg), effectivePpg);
 
     for(let content of files)
     {
@@ -195,38 +208,39 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
 
   async _uploadLevelImages(content, scene, importData)
   {
-    let extension = DDImporter.getImageType(atob(content.image.substr(0, 8)));
-
-    if (importData.toWebp)
-    {
-      extension = 'webp';
-    }
-
     content.pos_in_image = {x: 0, y: 0};
     content.pos_in_grid = {x: 0, y: 0};
 
-    let res = content.resolution;
-    let width = res.map_size.x * res.pixels_per_grid;
-    let height = res.map_size.y * res.pixels_per_grid;
+    // Skip the canvas roundtrip when no format conversion is needed.
+    if (!importData.toWebp) {
+      await DDImporter._uploadFromSourceImage(content, importData);
+      return;
+    }
 
-    let canvas = document.createElement('canvas');
+    const extension = 'webp';
+    const effectivePpg = scene.grid.size;
+    const width = content.resolution.map_size.x * effectivePpg;
+    const height = content.resolution.map_size.y * effectivePpg;
+
+    const canvas = document.createElement('canvas');
     canvas.width = width;
     canvas.height = height;
-    let canvasContext = canvas.getContext("2d");
+    const canvasContext = canvas.getContext("2d");
 
-    await DDImporter.image2Canvas(canvasContext, content, extension, width, height);
+    const sourceExtension = DDImporter.getImageType(atob(content.image.substr(0, 8)));
+    await DDImporter.image2Canvas(canvasContext, content, sourceExtension, width, height);
 
     await new Promise(function (resolve, reject) {
       canvas.toBlob(function (blob) {
         if (!blob) {
-          reject(new Error(`Canvas encoding failed. Dimensions ${canvas.width}x${canvas.height}.`));
+          reject(new Error(`Canvas encoding failed despite downscale. Dimensions ${canvas.width}x${canvas.height}.`));
           return;
         }
         blob.arrayBuffer()
           .then(bfr => DDImporter.uploadFile(bfr, content.name, importData.path, importData.source, extension, importData.bucket))
           .then(resolve)
           .catch(reject);
-      }, "image/" + extension, (importData.toWebp ? importData.webpQuality : undefined));
+      }, "image/" + extension, importData.webpQuality);
     });
   }
 
@@ -321,26 +335,18 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
       return files;
   }
 
-  _getLargestDimensions(files)
+  _getLargestDimensions(files, overridePpg)
   {
     let largestX = 0;
     let largestY = 0;
     for(let content of files)
     {
-      // let x = (content.resolution.map_size.x - content.resolution.map_origin.x) * content.resolution.pixels_per_grid;
-      // let y = (content.resolution.map_size.y - content.resolution.map_origin.y) * content.resolution.pixels_per_grid;
+      const ppg = overridePpg ?? content.resolution.pixels_per_grid;
+      let x = content.resolution.map_size.x * ppg;
+      let y = content.resolution.map_size.y * ppg;
 
-      let x = (content.resolution.map_size.x) * content.resolution.pixels_per_grid;
-      let y = (content.resolution.map_size.y) * content.resolution.pixels_per_grid;
-
-      if (x > largestX)
-      {
-        largestX = x;
-      }
-      if (y > largestY)
-      {
-        largestY = y;
-      }
+      if (x > largestX) largestX = x;
+      if (y > largestY) largestY = y;
     }
     return {width: largestX, height: largestY}
   }
@@ -410,6 +416,30 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
       pixelsPerGrid = customPixelsPerGrid
     } else {
       pixelsPerGrid = files[0].resolution.pixels_per_grid
+    }
+
+    // Pre-flight: total stitched extent in grid units, so we can downscale before
+    // allocating a canvas that the browser will silently refuse.
+    let totalGridX, totalGridY;
+    if (mode === 'x') {
+      totalGridX = files.length * files[0].resolution.map_size.x;
+      totalGridY = files[0].resolution.map_size.y;
+    } else if (mode === 'y') {
+      totalGridX = files[0].resolution.map_size.x;
+      totalGridY = files.length * files[0].resolution.map_size.y;
+    } else if (mode === 'g') {
+      const hwidth = Math.ceil(Math.sqrt(files.length));
+      totalGridX = hwidth * files[0].resolution.map_size.x;
+      totalGridY = Math.ceil(files.length / hwidth) * files[0].resolution.map_size.y;
+    } else {
+      totalGridX = files[0].resolution.map_size.x;
+      totalGridY = files[0].resolution.map_size.y;
+    }
+
+    const limitCheck = DDImporter._computeEffectivePPG(totalGridX, totalGridY, pixelsPerGrid);
+    if (limitCheck.scaled) {
+      ui.notifications.warn(`Image downscaled (browser canvas limit): PPI ${limitCheck.originalPpg} -> ${limitCheck.ppg}`);
+      pixelsPerGrid = limitCheck.ppg;
     }
     console.log("Grid PPI =", pixelsPerGrid);
 
@@ -721,6 +751,13 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
       return 'jpeg';
     }
     return 'png';
+  }
+
+  static async _uploadFromSourceImage(content, importData) {
+    const buffer = DDImporter.DecodeImage(content);
+    const extension = DDImporter.getImageType(atob(content.image.substr(0, 8)));
+    await DDImporter.uploadFile(buffer, content.name, importData.path, importData.source, extension, importData.bucket);
+    return extension;
   }
 
   static image2Canvas(canvas, file, extension, imageWidth, imageHeight) {
@@ -1074,5 +1111,37 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
 
     return within
 
+  }
+
+  // Conservative cross-browser canvas ceiling. Safari historically caps near 16k linear / ~256MB
+  // total bitmap memory; 11000 x 11000 RGBA ~= 484MB raw but in practice fits because of internal
+  // tiling. Tested against Chrome/Firefox/Safari with WebP encoding without OOM.
+  static BROWSER_LIMITS = {
+    maxDim: 11000,
+    maxArea: 11000 * 11000
+  };
+
+  static _computeEffectivePPG(mapSizeX, mapSizeY, requestedPpg) {
+    const maxSide = Math.max(mapSizeX, mapSizeY);
+    const otherSide = Math.min(mapSizeX, mapSizeY);
+    let ppg = requestedPpg;
+    let scaled = false;
+
+    if (maxSide * ppg > DDImporter.BROWSER_LIMITS.maxDim) {
+      ppg = Math.floor(DDImporter.BROWSER_LIMITS.maxDim / maxSide);
+      scaled = true;
+    }
+    if ((maxSide * ppg) * (otherSide * ppg) > DDImporter.BROWSER_LIMITS.maxArea) {
+      const areaPpg = Math.floor(Math.sqrt(DDImporter.BROWSER_LIMITS.maxArea / (maxSide * otherSide)));
+      if (areaPpg < ppg) {
+        ppg = areaPpg;
+        scaled = true;
+      }
+    }
+
+    if (ppg < 10) {
+      throw new Error(`Map is too large to import in this browser: even at PPI ${ppg}, the canvas would exceed limits. Grid extent: ${mapSizeX} x ${mapSizeY}.`);
+    }
+    return { ppg, scaled, originalPpg: requestedPpg };
   }
 }
