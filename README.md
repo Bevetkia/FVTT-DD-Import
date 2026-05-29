@@ -9,7 +9,8 @@ Allows importing Universal VTT map files into FoundryVTT.
 2. Go to the scene tab in FVTT, click the *Universal Battlemap import* button.
 3. Fill in the scene name, a path to where the image is to be saved, and the fidelity/offset options.  
   a. **Fidelity**: How many cave walls are used. Far left - less walls, better performance, Far right - more walls, worse performance  
-  b. **Offset**: How much to nudge the walls away from the edge.
-  c. **NEW:**: Adds the ability to multiple select files, instead of manually selecting 10 files by using add another file etc, can know select multiple instantly. 
+  b. **Offset**: How much to nudge the walls away from the edge. <br>
+   c. **NEW:**: Adds the ability to multiple select files, instead of manually selecting 10 files by using add another file etc, can know select multiple instantly. 
 
+  
   If you don't use S3, make sure the storage type is set to User Data and ignore the S3 fields.
