@@ -25,6 +25,7 @@ Hooks.on("init", () => {
       wallsAroundFiles: true,
       useCustomPixelsPerGrid: false,
       defaultCustomPixelsPerGrid: 100,
+      folderName: "",
     }
   })
 
@@ -115,6 +116,10 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
     context.useCustomPixelsPerGrid = settings.useCustomPixelsPerGrid;
     context.defaultCustomPixelsPerGrid = settings.defaultCustomPixelsPerGrid || 100;
 
+    context.folderName = settings.folderName || "";
+    // Populate existing scene folders for datalist suggestions
+    context.sceneFolders = game.folders.filter(f => f.type === "Scene").map(f => f.name);
+
     context.buttons = [{ type: "submit", label: "Submit", icon: "fa-solid fa-download" }]
     return context
   }
@@ -138,8 +143,22 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
       let useCustomPixelsPerGrid = formData.object["use-custom-gridPPI"]
       let customPixelsPerGrid = formData.object["customGridPPI"] * 1
 
+      let folderName = (formData.object["folderName"] || "").trim()
+
       if ((!bucket) && source == "s3")
         return ui.notifications.error("Bucket required for S3 upload")
+
+      // Resolve or create the target scene folder
+      let folderId = null
+      if (folderName) {
+        let existingFolder = game.folders.find(f => f.type === "Scene" && f.name === folderName)
+        if (existingFolder) {
+          folderId = existingFolder.id
+        } else {
+          let newFolder = await Folder.create({ name: folderName, type: "Scene" })
+          folderId = newFolder.id
+        }
+      }
 
       // Collect all selected File objects across all inputs into a flat list.
       // Each file gets its own scene; the "add another file" rows and multi-select
@@ -235,7 +254,7 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
 
         await p
         ui.notifications.notify("Creating scene: " + thisSceneName)
-        DDImporter.DDImport(aggregated, thisSceneName, thisFileName, path, fidelity, offset, padding, image_type, bucket, game.data.files.s3?.endpoint, source, pixelsPerGrid)
+        DDImporter.DDImport(aggregated, thisSceneName, thisFileName, path, fidelity, offset, padding, image_type, bucket, game.data.files.s3?.endpoint, source, pixelsPerGrid, folderId)
       }
 
       game.settings.set("dd-import", "importSettings", {
@@ -249,6 +268,7 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
         webpConversion: toWebp,
         webpQuality: webpQuality,
         wallsAroundFiles: wallsAroundFiles,
+        folderName: folderName,
       });
     }
     catch (e) {
@@ -423,7 +443,7 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
     await FilePicker.upload(source, path, uploadFile, { bucket: bucket })
   }
 
-  static async DDImport(file, sceneName, fileName, path, fidelity, offset, padding, extension, bucket, endpoint, source, pixelsPerGrid) {
+  static async DDImport(file, sceneName, fileName, path, fidelity, offset, padding, extension, bucket, endpoint, source, pixelsPerGrid, folderId = null) {
     if (path && path[path.length - 1] != "/")
       path = path + "/"
     let imagePath = path + fileName + "." + extension;
@@ -434,6 +454,7 @@ class DDImporter extends  foundry.applications.api.HandlebarsApplicationMixin(fo
     }
     let newScene = new Scene({
       name: sceneName,
+      folder: folderId,
       grid: {size : pixelsPerGrid},
       background : {
         src: imagePath
