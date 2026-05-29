@@ -5,6 +5,15 @@
       <input type='text' name="sceneName" />
     </div>
   </div>
+  <div class="form-group import" data-tooltip-direction="LEFT" data-tooltip="Scenes will be placed in this folder. Leave blank for no folder. Type to create a new folder or pick an existing one.">
+    <label class="import-options">Scene Folder</label>
+    <div class="form-fields">
+      <input type='text' name="folderName" value="{{folderName}}" list="dd-folder-list" placeholder="(none)" />
+      <datalist id="dd-folder-list">
+        {{#each sceneFolders}}<option value="{{this}}">{{/each}}
+      </datalist>
+    </div>
+  </div>
   <div class="form-group import" data-tooltip-direction="LEFT" data-tooltip="Select where the image is uploaded.">
     <label class="import-options">Storage Type</label>
         <div class="form-fields">
